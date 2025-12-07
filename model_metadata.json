@@ -1,10 +1,6 @@
 {
-  "version": "v3_20251207_131954",
-  "roc_auc": 0.990064521010925,
-  "false_positive_rate": 0.0212417377549291,
-  "samples": 300000,
-  "gaming_rate": 0.11495666666666667,
-  "features": 37,
-  "trained_at": "2025-12-07T13:19:54.222223",
-  "notes": "Production model with economic features, optimized for low FPR"
+  "version": "v4_20251207_135857",
+  "roc_auc": 0.9902564604376247,
+  "fpr": 0.03744018200360869,
+  "samples": 300000
 }
