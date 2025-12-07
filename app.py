@@ -4,7 +4,6 @@ import json
 import numpy as np
 from datetime import datetime
 from collections import defaultdict
-import base64
 
 app = Flask(__name__)
 
@@ -95,7 +94,6 @@ def update_history(mid, c, dur, rew):
         network_stats['durations'] = network_stats['durations'][-5000:]
 
 def score_job(data):
-    """Score a job and return ML results"""
     mid = data.get('machine_id', 'unknown')
     features = build_features(data)
     vec = [features.get(f, 0) for f in feature_list]
@@ -133,7 +131,6 @@ def health():
 
 @app.route('/predict', methods=['POST'])
 def predict():
-    """Direct prediction endpoint"""
     try:
         data = request.json
         if not data:
@@ -152,7 +149,13 @@ def webhook():
     """Helius webhook endpoint - receives JobRecorded events"""
     try:
         payload = request.json
-        print(f"Webhook received: {json.dumps(payload)[:500]}")
+        
+        # Log FULL payload for debugging
+        print("=" * 60)
+        print("WEBHOOK RECEIVED")
+        print("=" * 60)
+        print(json.dumps(payload, indent=2))
+        print("=" * 60)
         
         if not payload:
             return jsonify({'status': 'no payload'}), 200
@@ -162,39 +165,58 @@ def webhook():
         
         results = []
         for tx in transactions:
-            # Extract from Helius enhanced format
-            # Look for our program's events in the transaction
+            print(f"\n--- Processing TX ---")
+            print(f"Keys in tx: {list(tx.keys())}")
             
-            # Check if this is our program
-            account_keys = tx.get('accountKeys', [])
-            program_id = 'AyFBC6DBStSbrau3wfFZzsX5rX14nx8Gkp8TqF687F5X'
+            # Get signature
+            signature = tx.get('signature', 'unknown')
+            print(f"Signature: {signature}")
             
-            if program_id not in str(account_keys):
-                continue
+            # Look for events (Anchor programs emit events here)
+            events = tx.get('events', {})
+            print(f"Events: {events}")
             
-            # Try to extract JobRecorded event data from logs
-            logs = tx.get('meta', {}).get('logMessages', []) or tx.get('logMessages', [])
+            # Look for instructions
+            instructions = tx.get('instructions', [])
+            print(f"Instructions count: {len(instructions)}")
+            for i, ix in enumerate(instructions):
+                print(f"  Instruction {i}: {ix.get('programId', 'unknown')[:20]}...")
+                if 'data' in ix:
+                    print(f"    Data: {ix['data'][:50]}...")
+                if 'accounts' in ix:
+                    print(f"    Accounts: {len(ix['accounts'])} accounts")
             
-            # Parse event data from logs
-            job_data = None
-            for log in logs:
-                if 'JobRecorded' in log or 'job_hash' in log:
-                    # Found our event
-                    job_data = parse_job_from_logs(logs, tx)
-                    break
+            # Look for inner instructions
+            inner = tx.get('innerInstructions', [])
+            print(f"Inner instructions: {len(inner)}")
             
-            if not job_data:
-                # Try to extract from transaction instructions
-                job_data = parse_job_from_tx(tx)
+            # Look for logs
+            log_messages = tx.get('logMessages', [])
+            print(f"Log messages: {len(log_messages)}")
+            for log in log_messages[:10]:
+                print(f"  {log[:100]}")
+            
+            # Look for native transfers
+            native = tx.get('nativeTransfers', [])
+            print(f"Native transfers: {len(native)}")
+            
+            # Look for token transfers  
+            token = tx.get('tokenTransfers', [])
+            print(f"Token transfers: {len(token)}")
+            
+            # Try to extract job data from various places
+            job_data = extract_job_data(tx)
             
             if job_data:
+                print(f"\n>>> EXTRACTED JOB DATA: {job_data}")
                 result = score_job(job_data)
-                result['job_hash'] = job_data.get('job_hash')
+                result['job_hash'] = job_data.get('job_hash', signature[:32])
                 result['machine_id'] = job_data.get('machine_id')
-                result['signature'] = tx.get('signature')
+                result['signature'] = signature
                 results.append(result)
-                
-                print(f"Scored job: {result}")
+                print(f">>> SCORED: {result}")
+            else:
+                print(">>> No job data extracted")
         
         return jsonify({
             'status': 'processed',
@@ -203,55 +225,69 @@ def webhook():
         })
         
     except Exception as e:
-        print(f"Webhook error: {str(e)}")
+        print(f"WEBHOOK ERROR: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
-def parse_job_from_logs(logs, tx):
-    """Extract job data from transaction logs"""
-    try:
-        # Anchor emits events as base64 in logs
-        for log in logs:
-            if 'Program data:' in log:
-                # This is event data
-                data_part = log.split('Program data: ')[-1]
-                # Decode and parse (simplified - may need adjustment)
-                pass
-        
-        # Fallback: extract from instruction data
-        return parse_job_from_tx(tx)
-    except:
-        return None
-
-def parse_job_from_tx(tx):
-    """Extract job data from transaction structure"""
-    try:
-        # Get instructions
-        instructions = tx.get('instructions', [])
-        
-        for ix in instructions:
-            # Look for record_job instruction
-            data = ix.get('data', '')
+def extract_job_data(tx):
+    """Extract job data from Helius transaction"""
+    
+    # Method 1: Check for parsed events (Anchor events)
+    events = tx.get('events', {})
+    if events:
+        # Look for our JobRecorded event
+        program_events = events.get('nft', events.get('swap', events.get('compressed', None)))
+        if program_events:
+            print(f"Found program events: {program_events}")
+    
+    # Method 2: Parse from account data changes
+    account_data = tx.get('accountData', [])
+    for acc in account_data:
+        account = acc.get('account', '')
+        # Look for job account (newly created accounts have balance change)
+        if acc.get('nativeBalanceChange', 0) < 0:
+            print(f"Account with balance change: {account}")
+    
+    # Method 3: Parse from instructions
+    instructions = tx.get('instructions', [])
+    our_program = 'AyFBC6DBStSbrau3wfFZzsX5rX14nx8Gkp8TqF687F5X'
+    
+    for ix in instructions:
+        program_id = ix.get('programId', '')
+        if program_id == our_program:
+            print(f"Found our program instruction!")
             accounts = ix.get('accounts', [])
+            data = ix.get('data', '')
             
-            if len(accounts) >= 4:  # record_job has state, machine_state, job, machine, payer
-                # Extract machine pubkey
-                machine_id = accounts[3] if len(accounts) > 3 else 'unknown'
+            # accounts for record_job: [state, machine_state, job, machine, payer, system]
+            if len(accounts) >= 4:
+                machine_pubkey = accounts[3] if len(accounts) > 3 else None
+                job_pubkey = accounts[2] if len(accounts) > 2 else None
                 
-                # For now, use placeholder values - we'll refine this
+                print(f"Machine: {machine_pubkey}")
+                print(f"Job: {job_pubkey}")
+                print(f"Instruction data: {data}")
+                
+                # Decode instruction data (base58 encoded)
+                # For now, use test values - we'll decode properly next
                 return {
-                    'machine_id': str(machine_id),
-                    'job_hash': tx.get('signature', 'unknown')[:32],
-                    'duration_seconds': 300,  # Will extract from ix data
+                    'machine_id': str(machine_pubkey),
+                    'job_hash': str(job_pubkey),
+                    'duration_seconds': 300,
                     'complexity_claimed': 1.0,
                     'reward_gross': 5.0,
                     'activity_ratio': 1.0,
                     'decay_multiplier': 1.0
                 }
-        
-        return None
-    except Exception as e:
-        print(f"Parse error: {e}")
-        return None
+    
+    # Method 4: Check inner instructions
+    for inner in tx.get('innerInstructions', []):
+        for ix in inner.get('instructions', []):
+            if ix.get('programId', '') == our_program:
+                print(f"Found our program in inner instructions")
+    
+    return None
 
 @app.route('/stats')
 def stats():
@@ -263,10 +299,8 @@ def stats():
         'jobs': len(network_stats['complexities'])
     })
 
-# Test endpoint to simulate webhook
 @app.route('/test-webhook', methods=['POST'])
 def test_webhook():
-    """Test endpoint to simulate a job"""
     data = request.json or {
         'machine_id': 'test-machine-001',
         'job_hash': 'test-job-' + str(datetime.now().timestamp()),
