@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 import joblib
 import json
 import numpy as np
@@ -8,6 +8,8 @@ import base58
 import struct
 import os
 import time
+import csv
+import io
 
 app = Flask(__name__)
 
@@ -39,6 +41,7 @@ machine_history = defaultdict(lambda: {
 })
 network_stats = {'complexities': [], 'durations': []}
 scored_jobs = []
+community_disputes = []  # Store disputes for retraining
 
 def get_network_stats():
     if not network_stats['complexities']:
@@ -169,8 +172,6 @@ def decode_record_job_instruction(data_b58):
         return None
 
 def call_update_trust(machine_pubkey, job_pubkey, job_hash, ml_confidence, trust_delta):
-    """Call update_trust on Solana with retry"""
-    
     for attempt in range(3):
         try:
             if not oracle_keypair:
@@ -179,7 +180,6 @@ def call_update_trust(machine_pubkey, job_pubkey, job_hash, ml_confidence, trust
             if not STATE_ACCOUNT:
                 return {'status': 'skipped', 'reason': 'no_state_account'}
             
-            # Wait for account to propagate on retries
             if attempt > 0:
                 print(f"Retry attempt {attempt + 1}, waiting 2s...")
                 time.sleep(2)
@@ -260,6 +260,7 @@ def health():
         'version': config.get('version'),
         'machines': len(machine_history), 
         'jobs': len(network_stats['complexities']),
+        'disputes': len(community_disputes),
         'oracle_configured': oracle_keypair is not None,
         'state_configured': bool(STATE_ACCOUNT),
         'state_account': STATE_ACCOUNT[:16] + '...' if STATE_ACCOUNT else None
@@ -315,7 +316,7 @@ def webhook():
                     'timestamp': datetime.now().isoformat(),
                     **result
                 })
-                if len(scored_jobs) > 100:
+                if len(scored_jobs) > 1000:
                     scored_jobs.pop(0)
                 
                 trust_result = call_update_trust(
@@ -389,14 +390,15 @@ def stats():
         'network_avg_complexity': net['avg_c'],
         'network_avg_duration': net['avg_d'],
         'machines': len(machine_history),
-        'jobs': len(network_stats['complexities'])
+        'jobs': len(network_stats['complexities']),
+        'disputes': len(community_disputes)
     })
 
 @app.route('/recent-scores')
 def recent_scores():
     return jsonify({
         'count': len(scored_jobs),
-        'jobs': scored_jobs[-20:]
+        'jobs': scored_jobs[-50:]
     })
 
 @app.route('/machine/<machine_id>')
@@ -412,6 +414,102 @@ def machine_info(machine_id):
         'avg_complexity': np.mean(h.get('complexities', [1.0])) if h.get('complexities') else 1.0,
         'avg_duration': np.mean(h.get('durations', [300])) if h.get('durations') else 300,
     })
+
+# COMMUNITY DISPUTE SYSTEM
+@app.route('/dispute', methods=['POST'])
+def submit_dispute():
+    """Submit a community dispute of an ML decision"""
+    try:
+        data = request.json
+        if not data:
+            return jsonify({'error': 'No data'}), 400
+        
+        job_hash = data.get('job_hash')
+        dispute_type = data.get('dispute_type')  # 'false_positive' or 'false_negative'
+        reason = data.get('reason', '')
+        
+        if not job_hash or not dispute_type:
+            return jsonify({'error': 'job_hash and dispute_type required'}), 400
+        
+        # Find the original score
+        original = next((j for j in scored_jobs if j.get('job_hash') == job_hash), None)
+        
+        dispute = {
+            'timestamp': datetime.now().isoformat(),
+            'job_hash': job_hash,
+            'dispute_type': dispute_type,
+            'reason': reason,
+            'original_score': original
+        }
+        
+        community_disputes.append(dispute)
+        
+        # Keep last 1000 disputes
+        if len(community_disputes) > 1000:
+            community_disputes.pop(0)
+        
+        print(f"DISPUTE: {dispute_type} for {job_hash[:20]}... - {reason}")
+        
+        return jsonify({
+            'status': 'recorded',
+            'total_disputes': len(community_disputes),
+            'dispute': dispute
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/disputes')
+def get_disputes():
+    """Get all community disputes"""
+    return jsonify({
+        'count': len(community_disputes),
+        'disputes': community_disputes[-100:]
+    })
+
+@app.route('/export-training-data')
+def export_training_data():
+    """Export scored jobs + disputes as CSV for retraining"""
+    output = io.StringIO()
+    writer = csv.writer(output)
+    
+    # Header
+    writer.writerow([
+        'timestamp', 'job_hash', 'machine_id', 'duration_seconds', 'complexity_claimed',
+        'ml_confidence', 'ml_action', 'trust_delta', 'disputed', 'dispute_type', 'dispute_reason'
+    ])
+    
+    # Build dispute lookup
+    dispute_lookup = {}
+    for d in community_disputes:
+        dispute_lookup[d['job_hash']] = d
+    
+    # Write scored jobs
+    for job in scored_jobs:
+        job_hash = job.get('job_hash', '')
+        dispute = dispute_lookup.get(job_hash, {})
+        
+        writer.writerow([
+            job.get('timestamp', ''),
+            job_hash,
+            job.get('machine_id', ''),
+            job.get('duration_seconds', ''),
+            job.get('complexity_claimed', ''),
+            job.get('confidence', ''),
+            job.get('action', ''),
+            job.get('trust_delta', ''),
+            'yes' if dispute else 'no',
+            dispute.get('dispute_type', ''),
+            dispute.get('reason', '')
+        ])
+    
+    output.seek(0)
+    
+    return Response(
+        output.getvalue(),
+        mimetype='text/csv',
+        headers={'Content-Disposition': f'attachment; filename=training_data_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'}
+    )
 
 @app.route('/test-webhook', methods=['POST'])
 def test_webhook():
