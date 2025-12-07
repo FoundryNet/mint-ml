@@ -7,6 +7,7 @@ from collections import defaultdict
 import base58
 import struct
 import os
+import time
 
 app = Flask(__name__)
 
@@ -18,13 +19,11 @@ with open('model_features.json', 'r') as f:
 
 print(f"Model loaded. {len(feature_list)} features.")
 
-# Configuration from environment
 PROGRAM_ID = os.environ.get('PROGRAM_ID', 'AyFBC6DBStSbrau3wfFZzsX5rX14nx8Gkp8TqF687F5X')
 STATE_ACCOUNT = os.environ.get('STATE_ACCOUNT', '')
 SOLANA_RPC = os.environ.get('SOLANA_RPC', 'https://api.devnet.solana.com')
 ORACLE_PRIVATE_KEY = os.environ.get('ORACLE_PRIVATE_KEY', '')
 
-# Parse oracle keypair
 oracle_keypair = None
 if ORACLE_PRIVATE_KEY:
     try:
@@ -40,7 +39,6 @@ machine_history = defaultdict(lambda: {
 })
 network_stats = {'complexities': [], 'durations': []}
 scored_jobs = []
-pending_trust_updates = []
 
 def get_network_stats():
     if not network_stats['complexities']:
@@ -144,7 +142,7 @@ def score_job(data):
 def decode_record_job_instruction(data_b58):
     try:
         data = base58.b58decode(data_b58)
-        offset = 8  # Skip discriminator
+        offset = 8
         
         if len(data) > offset + 4:
             str_len = struct.unpack('<I', data[offset:offset+4])[0]
@@ -171,100 +169,89 @@ def decode_record_job_instruction(data_b58):
         return None
 
 def call_update_trust(machine_pubkey, job_pubkey, job_hash, ml_confidence, trust_delta):
-    """Call update_trust on Solana"""
-    try:
-        if not oracle_keypair:
-            print("No oracle key configured")
-            return {'status': 'skipped', 'reason': 'no_oracle_key'}
-        
-        if not STATE_ACCOUNT:
-            print("No state account configured")
-            return {'status': 'skipped', 'reason': 'no_state_account'}
-        
-        # Import solana libraries
-        from solders.keypair import Keypair
-        from solders.pubkey import Pubkey
-        from solders.instruction import Instruction, AccountMeta
-        from solders.transaction import Transaction
-        from solders.message import Message
-        from solders.hash import Hash
-        from solana.rpc.api import Client
-        import hashlib
-        
-        client = Client(SOLANA_RPC)
-        
-        # Create keypair from bytes
-        oracle = Keypair.from_bytes(oracle_keypair)
-        print(f"Oracle pubkey: {oracle.pubkey()}")
-        
-        # Derive PDAs
-        program_id = Pubkey.from_string(PROGRAM_ID)
-        state_pubkey = Pubkey.from_string(STATE_ACCOUNT)
-        machine_pubkey_obj = Pubkey.from_string(machine_pubkey)
-        job_pubkey_obj = Pubkey.from_string(job_pubkey)
-        
-        # Machine state PDA
-        machine_state_pda, machine_bump = Pubkey.find_program_address(
-            [b"machine", bytes(machine_pubkey_obj)],
-            program_id
-        )
-        
-        # Job PDA (already have the pubkey from the transaction)
-        
-        # Build instruction data
-        # Discriminator for update_trust (first 8 bytes of sha256("global:update_trust"))
-        discriminator = hashlib.sha256(b"global:update_trust").digest()[:8]
-        
-        # Arguments: job_hash (String), ml_confidence (u32), trust_delta (i32)
-        job_hash_bytes = job_hash.encode('utf-8')
-        instruction_data = (
-            discriminator +
-            struct.pack('<I', len(job_hash_bytes)) +
-            job_hash_bytes +
-            struct.pack('<I', ml_confidence) +
-            struct.pack('<i', trust_delta)
-        )
-        
-        # Build instruction
-        accounts = [
-            AccountMeta(state_pubkey, is_signer=False, is_writable=False),
-            AccountMeta(machine_state_pda, is_signer=False, is_writable=True),
-            AccountMeta(job_pubkey_obj, is_signer=False, is_writable=True),
-            AccountMeta(oracle.pubkey(), is_signer=True, is_writable=False),
-        ]
-        
-        instruction = Instruction(program_id, instruction_data, accounts)
-        
-        # Get recent blockhash
-        blockhash_resp = client.get_latest_blockhash()
-        recent_blockhash = blockhash_resp.value.blockhash
-        
-        # Build and sign transaction
-        message = Message.new_with_blockhash(
-            [instruction],
-            oracle.pubkey(),
-            recent_blockhash
-        )
-        tx = Transaction.new_unsigned(message)
-        tx.sign([oracle], recent_blockhash)
-        
-        # Send transaction
-        result = client.send_transaction(tx)
-        
-        print(f"update_trust tx sent: {result.value}")
-        
-        return {
-            'status': 'sent',
-            'signature': str(result.value),
-            'machine': machine_pubkey,
-            'trust_delta': trust_delta
-        }
-        
-    except Exception as e:
-        print(f"update_trust error: {e}")
-        import traceback
-        traceback.print_exc()
-        return {'status': 'error', 'reason': str(e)}
+    """Call update_trust on Solana with retry"""
+    
+    for attempt in range(3):
+        try:
+            if not oracle_keypair:
+                return {'status': 'skipped', 'reason': 'no_oracle_key'}
+            
+            if not STATE_ACCOUNT:
+                return {'status': 'skipped', 'reason': 'no_state_account'}
+            
+            # Wait for account to propagate on retries
+            if attempt > 0:
+                print(f"Retry attempt {attempt + 1}, waiting 2s...")
+                time.sleep(2)
+            
+            from solders.keypair import Keypair
+            from solders.pubkey import Pubkey
+            from solders.instruction import Instruction, AccountMeta
+            from solders.transaction import Transaction
+            from solders.message import Message
+            from solana.rpc.api import Client
+            import hashlib
+            
+            client = Client(SOLANA_RPC)
+            oracle = Keypair.from_bytes(oracle_keypair)
+            print(f"Oracle pubkey: {oracle.pubkey()}")
+            
+            program_id = Pubkey.from_string(PROGRAM_ID)
+            state_pubkey = Pubkey.from_string(STATE_ACCOUNT)
+            machine_pubkey_obj = Pubkey.from_string(machine_pubkey)
+            job_pubkey_obj = Pubkey.from_string(job_pubkey)
+            
+            machine_state_pda, _ = Pubkey.find_program_address(
+                [b"machine", bytes(machine_pubkey_obj)],
+                program_id
+            )
+            
+            discriminator = hashlib.sha256(b"global:update_trust").digest()[:8]
+            job_hash_bytes = job_hash.encode('utf-8')
+            instruction_data = (
+                discriminator +
+                struct.pack('<I', len(job_hash_bytes)) +
+                job_hash_bytes +
+                struct.pack('<I', ml_confidence) +
+                struct.pack('<i', trust_delta)
+            )
+            
+            accounts = [
+                AccountMeta(state_pubkey, is_signer=False, is_writable=False),
+                AccountMeta(machine_state_pda, is_signer=False, is_writable=True),
+                AccountMeta(job_pubkey_obj, is_signer=False, is_writable=True),
+                AccountMeta(oracle.pubkey(), is_signer=True, is_writable=False),
+            ]
+            
+            instruction = Instruction(program_id, instruction_data, accounts)
+            
+            blockhash_resp = client.get_latest_blockhash()
+            recent_blockhash = blockhash_resp.value.blockhash
+            
+            message = Message.new_with_blockhash(
+                [instruction],
+                oracle.pubkey(),
+                recent_blockhash
+            )
+            tx = Transaction.new_unsigned(message)
+            tx.sign([oracle], recent_blockhash)
+            
+            result = client.send_transaction(tx)
+            print(f"update_trust tx sent: {result.value}")
+            
+            return {
+                'status': 'sent',
+                'signature': str(result.value),
+                'machine': machine_pubkey,
+                'trust_delta': trust_delta
+            }
+            
+        except Exception as e:
+            print(f"update_trust attempt {attempt + 1} error: {e}")
+            if attempt == 2:
+                return {'status': 'error', 'reason': str(e)[:200]}
+    
+    return {'status': 'error', 'reason': 'max retries'}
 
 @app.route('/health')
 def health():
@@ -274,7 +261,8 @@ def health():
         'machines': len(machine_history), 
         'jobs': len(network_stats['complexities']),
         'oracle_configured': oracle_keypair is not None,
-        'state_configured': bool(STATE_ACCOUNT)
+        'state_configured': bool(STATE_ACCOUNT),
+        'state_account': STATE_ACCOUNT[:16] + '...' if STATE_ACCOUNT else None
     })
 
 @app.route('/predict', methods=['POST'])
@@ -330,7 +318,6 @@ def webhook():
                 if len(scored_jobs) > 100:
                     scored_jobs.pop(0)
                 
-                # Call update_trust on-chain
                 trust_result = call_update_trust(
                     job_data.get('machine_id'),
                     job_data.get('job_pubkey'),
