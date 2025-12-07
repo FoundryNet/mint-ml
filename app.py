@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify, Response
+from flask_cors import CORS
 import joblib
 import json
 import numpy as np
@@ -12,6 +13,7 @@ import csv
 import io
 
 app = Flask(__name__)
+CORS(app)  # Enable CORS for dashboard
 
 model = joblib.load('model.pkl')
 with open('model_metadata.json', 'r') as f:
@@ -41,7 +43,7 @@ machine_history = defaultdict(lambda: {
 })
 network_stats = {'complexities': [], 'durations': []}
 scored_jobs = []
-community_disputes = []  # Store disputes for retraining
+community_disputes = []
 
 def get_network_stats():
     if not network_stats['complexities']:
@@ -172,86 +174,84 @@ def decode_record_job_instruction(data_b58):
         return None
 
 def call_update_trust(machine_pubkey, job_pubkey, job_hash, ml_confidence, trust_delta):
-    for attempt in range(3):
-        try:
-            if not oracle_keypair:
-                return {'status': 'skipped', 'reason': 'no_oracle_key'}
-            
-            if not STATE_ACCOUNT:
-                return {'status': 'skipped', 'reason': 'no_state_account'}
-            
-            if attempt > 0:
-                print(f"Retry attempt {attempt + 1}, waiting 2s...")
-                time.sleep(2)
-            
-            from solders.keypair import Keypair
-            from solders.pubkey import Pubkey
-            from solders.instruction import Instruction, AccountMeta
-            from solders.transaction import Transaction
-            from solders.message import Message
-            from solana.rpc.api import Client
-            import hashlib
-            
-            client = Client(SOLANA_RPC)
-            oracle = Keypair.from_bytes(oracle_keypair)
-            print(f"Oracle pubkey: {oracle.pubkey()}")
-            
-            program_id = Pubkey.from_string(PROGRAM_ID)
-            state_pubkey = Pubkey.from_string(STATE_ACCOUNT)
-            machine_pubkey_obj = Pubkey.from_string(machine_pubkey)
-            job_pubkey_obj = Pubkey.from_string(job_pubkey)
-            
-            machine_state_pda, _ = Pubkey.find_program_address(
-                [b"machine", bytes(machine_pubkey_obj)],
-                program_id
-            )
-            
-            discriminator = hashlib.sha256(b"global:update_trust").digest()[:8]
-            job_hash_bytes = job_hash.encode('utf-8')
-            instruction_data = (
-                discriminator +
-                struct.pack('<I', len(job_hash_bytes)) +
-                job_hash_bytes +
-                struct.pack('<I', ml_confidence) +
-                struct.pack('<i', trust_delta)
-            )
-            
-            accounts = [
-                AccountMeta(state_pubkey, is_signer=False, is_writable=False),
-                AccountMeta(machine_state_pda, is_signer=False, is_writable=True),
-                AccountMeta(job_pubkey_obj, is_signer=False, is_writable=True),
-                AccountMeta(oracle.pubkey(), is_signer=True, is_writable=False),
-            ]
-            
-            instruction = Instruction(program_id, instruction_data, accounts)
-            
-            blockhash_resp = client.get_latest_blockhash()
-            recent_blockhash = blockhash_resp.value.blockhash
-            
-            message = Message.new_with_blockhash(
-                [instruction],
-                oracle.pubkey(),
-                recent_blockhash
-            )
-            tx = Transaction.new_unsigned(message)
-            tx.sign([oracle], recent_blockhash)
-            
-            result = client.send_transaction(tx)
-            print(f"update_trust tx sent: {result.value}")
-            
-            return {
-                'status': 'sent',
-                'signature': str(result.value),
-                'machine': machine_pubkey,
-                'trust_delta': trust_delta
-            }
-            
-        except Exception as e:
-            print(f"update_trust attempt {attempt + 1} error: {e}")
-            if attempt == 2:
-                return {'status': 'error', 'reason': str(e)[:200]}
-    
-    return {'status': 'error', 'reason': 'max retries'}
+    """Call update_trust - single attempt, no retry loop"""
+    try:
+        if not oracle_keypair:
+            return {'status': 'skipped', 'reason': 'no_oracle_key'}
+        
+        if not STATE_ACCOUNT:
+            return {'status': 'skipped', 'reason': 'no_state_account'}
+        
+        from solders.keypair import Keypair
+        from solders.pubkey import Pubkey
+        from solders.instruction import Instruction, AccountMeta
+        from solders.transaction import Transaction
+        from solders.message import Message
+        from solana.rpc.api import Client
+        import hashlib
+        
+        client = Client(SOLANA_RPC)
+        oracle = Keypair.from_bytes(oracle_keypair)
+        
+        program_id = Pubkey.from_string(PROGRAM_ID)
+        state_pubkey = Pubkey.from_string(STATE_ACCOUNT)
+        machine_pubkey_obj = Pubkey.from_string(machine_pubkey)
+        job_pubkey_obj = Pubkey.from_string(job_pubkey)
+        
+        machine_state_pda, _ = Pubkey.find_program_address(
+            [b"machine", bytes(machine_pubkey_obj)],
+            program_id
+        )
+        
+        discriminator = hashlib.sha256(b"global:update_trust").digest()[:8]
+        job_hash_bytes = job_hash.encode('utf-8')
+        instruction_data = (
+            discriminator +
+            struct.pack('<I', len(job_hash_bytes)) +
+            job_hash_bytes +
+            struct.pack('<I', ml_confidence) +
+            struct.pack('<i', trust_delta)
+        )
+        
+        accounts = [
+            AccountMeta(state_pubkey, is_signer=False, is_writable=False),
+            AccountMeta(machine_state_pda, is_signer=False, is_writable=True),
+            AccountMeta(job_pubkey_obj, is_signer=False, is_writable=True),
+            AccountMeta(oracle.pubkey(), is_signer=True, is_writable=False),
+        ]
+        
+        instruction = Instruction(program_id, instruction_data, accounts)
+        
+        blockhash_resp = client.get_latest_blockhash()
+        recent_blockhash = blockhash_resp.value.blockhash
+        
+        message = Message.new_with_blockhash(
+            [instruction],
+            oracle.pubkey(),
+            recent_blockhash
+        )
+        tx = Transaction.new_unsigned(message)
+        tx.sign([oracle], recent_blockhash)
+        
+        result = client.send_transaction(tx)
+        print(f"update_trust tx: {result.value}")
+        
+        return {
+            'status': 'sent',
+            'signature': str(result.value),
+            'machine': machine_pubkey,
+            'trust_delta': trust_delta
+        }
+        
+    except Exception as e:
+        error_str = str(e)
+        # Don't log full error for known issues
+        if 'AccountNotInitialized' in error_str:
+            print(f"update_trust skipped: machine not registered in current state")
+            return {'status': 'skipped', 'reason': 'machine_not_registered'}
+        else:
+            print(f"update_trust error: {error_str[:100]}")
+            return {'status': 'error', 'reason': error_str[:100]}
 
 @app.route('/health')
 def health():
@@ -262,8 +262,7 @@ def health():
         'jobs': len(network_stats['complexities']),
         'disputes': len(community_disputes),
         'oracle_configured': oracle_keypair is not None,
-        'state_configured': bool(STATE_ACCOUNT),
-        'state_account': STATE_ACCOUNT[:16] + '...' if STATE_ACCOUNT else None
+        'state_configured': bool(STATE_ACCOUNT)
     })
 
 @app.route('/predict', methods=['POST'])
@@ -286,10 +285,6 @@ def webhook():
     try:
         payload = request.json
         
-        print("=" * 60)
-        print("WEBHOOK RECEIVED")
-        print("=" * 60)
-        
         if not payload:
             return jsonify({'status': 'no payload'}), 200
         
@@ -298,12 +293,10 @@ def webhook():
         results = []
         for tx in transactions:
             signature = tx.get('signature', 'unknown')
-            print(f"Processing tx: {signature[:20]}...")
-            
             job_data = extract_job_data(tx)
             
             if job_data:
-                print(f"Job data: {job_data}")
+                print(f"Scoring: {job_data.get('job_hash', '')[:20]}...")
                 result = score_job(job_data)
                 result['job_hash'] = job_data.get('job_hash')
                 result['machine_id'] = job_data.get('machine_id')
@@ -319,6 +312,7 @@ def webhook():
                 if len(scored_jobs) > 1000:
                     scored_jobs.pop(0)
                 
+                # Single attempt, no retry
                 trust_result = call_update_trust(
                     job_data.get('machine_id'),
                     job_data.get('job_pubkey'),
@@ -329,7 +323,7 @@ def webhook():
                 result['trust_update'] = trust_result
                 
                 results.append(result)
-                print(f"SCORED: {result}")
+                print(f"SCORED: {result['action']} ({result['confidence']:.2%}) -> {trust_result['status']}")
         
         return jsonify({
             'status': 'processed',
@@ -339,8 +333,6 @@ def webhook():
         
     except Exception as e:
         print(f"WEBHOOK ERROR: {str(e)}")
-        import traceback
-        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 def extract_job_data(tx):
@@ -369,18 +361,6 @@ def extract_job_data(tx):
                         'activity_ratio': 1.0,
                         'decay_multiplier': 1.0
                     }
-                else:
-                    return {
-                        'machine_id': str(machine_pubkey),
-                        'job_hash': str(job_pubkey),
-                        'job_pubkey': str(job_pubkey),
-                        'duration_seconds': 300,
-                        'complexity_claimed': 1.0,
-                        'reward_gross': 5.0,
-                        'activity_ratio': 1.0,
-                        'decay_multiplier': 1.0
-                    }
-    
     return None
 
 @app.route('/stats')
@@ -415,23 +395,20 @@ def machine_info(machine_id):
         'avg_duration': np.mean(h.get('durations', [300])) if h.get('durations') else 300,
     })
 
-# COMMUNITY DISPUTE SYSTEM
 @app.route('/dispute', methods=['POST'])
 def submit_dispute():
-    """Submit a community dispute of an ML decision"""
     try:
         data = request.json
         if not data:
             return jsonify({'error': 'No data'}), 400
         
         job_hash = data.get('job_hash')
-        dispute_type = data.get('dispute_type')  # 'false_positive' or 'false_negative'
+        dispute_type = data.get('dispute_type')
         reason = data.get('reason', '')
         
         if not job_hash or not dispute_type:
             return jsonify({'error': 'job_hash and dispute_type required'}), 400
         
-        # Find the original score
         original = next((j for j in scored_jobs if j.get('job_hash') == job_hash), None)
         
         dispute = {
@@ -443,12 +420,10 @@ def submit_dispute():
         }
         
         community_disputes.append(dispute)
-        
-        # Keep last 1000 disputes
         if len(community_disputes) > 1000:
             community_disputes.pop(0)
         
-        print(f"DISPUTE: {dispute_type} for {job_hash[:20]}... - {reason}")
+        print(f"DISPUTE: {dispute_type} for {job_hash[:20]}...")
         
         return jsonify({
             'status': 'recorded',
@@ -461,7 +436,6 @@ def submit_dispute():
 
 @app.route('/disputes')
 def get_disputes():
-    """Get all community disputes"""
     return jsonify({
         'count': len(community_disputes),
         'disputes': community_disputes[-100:]
@@ -469,22 +443,16 @@ def get_disputes():
 
 @app.route('/export-training-data')
 def export_training_data():
-    """Export scored jobs + disputes as CSV for retraining"""
     output = io.StringIO()
     writer = csv.writer(output)
     
-    # Header
     writer.writerow([
         'timestamp', 'job_hash', 'machine_id', 'duration_seconds', 'complexity_claimed',
         'ml_confidence', 'ml_action', 'trust_delta', 'disputed', 'dispute_type', 'dispute_reason'
     ])
     
-    # Build dispute lookup
-    dispute_lookup = {}
-    for d in community_disputes:
-        dispute_lookup[d['job_hash']] = d
+    dispute_lookup = {d['job_hash']: d for d in community_disputes}
     
-    # Write scored jobs
     for job in scored_jobs:
         job_hash = job.get('job_hash', '')
         dispute = dispute_lookup.get(job_hash, {})
@@ -510,22 +478,6 @@ def export_training_data():
         mimetype='text/csv',
         headers={'Content-Disposition': f'attachment; filename=training_data_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'}
     )
-
-@app.route('/test-webhook', methods=['POST'])
-def test_webhook():
-    data = request.json or {
-        'machine_id': 'test-machine-001',
-        'job_hash': 'test-job-' + str(datetime.now().timestamp()),
-        'duration_seconds': 300,
-        'complexity_claimed': 1.2,
-        'reward_gross': 5.0
-    }
-    
-    result = score_job(data)
-    result['job_hash'] = data.get('job_hash')
-    result['machine_id'] = data.get('machine_id')
-    
-    return jsonify(result)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
