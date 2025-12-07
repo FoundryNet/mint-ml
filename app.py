@@ -18,19 +18,29 @@ with open('model_features.json', 'r') as f:
 
 print(f"Model loaded. {len(feature_list)} features.")
 
-# Program ID
-PROGRAM_ID = 'AyFBC6DBStSbrau3wfFZzsX5rX14nx8Gkp8TqF687F5X'
+# Configuration from environment
+PROGRAM_ID = os.environ.get('PROGRAM_ID', 'AyFBC6DBStSbrau3wfFZzsX5rX14nx8Gkp8TqF687F5X')
+STATE_ACCOUNT = os.environ.get('STATE_ACCOUNT', '')
+SOLANA_RPC = os.environ.get('SOLANA_RPC', 'https://api.devnet.solana.com')
+ORACLE_PRIVATE_KEY = os.environ.get('ORACLE_PRIVATE_KEY', '')
 
-# Oracle keypair for signing update_trust transactions
-# In production, load from environment variable
-ORACLE_PRIVATE_KEY = os.environ.get('ORACLE_PRIVATE_KEY', None)
+# Parse oracle keypair
+oracle_keypair = None
+if ORACLE_PRIVATE_KEY:
+    try:
+        key_bytes = json.loads(ORACLE_PRIVATE_KEY)
+        oracle_keypair = bytes(key_bytes)
+        print(f"Oracle keypair loaded: {len(oracle_keypair)} bytes")
+    except Exception as e:
+        print(f"Failed to load oracle keypair: {e}")
 
 machine_history = defaultdict(lambda: {
     'job_count': 0, 'total_earned': 0, 
     'complexities': [], 'durations': []
 })
 network_stats = {'complexities': [], 'durations': []}
-scored_jobs = []  # Store recent scores for inspection
+scored_jobs = []
+pending_trust_updates = []
 
 def get_network_stats():
     if not network_stats['complexities']:
@@ -132,71 +142,128 @@ def score_job(data):
     }
 
 def decode_record_job_instruction(data_b58):
-    """Decode record_job instruction data from base58"""
     try:
         data = base58.b58decode(data_b58)
-        print(f"Decoded bytes length: {len(data)}")
-        print(f"Decoded bytes hex: {data.hex()}")
+        offset = 8  # Skip discriminator
         
-        # Anchor discriminator is first 8 bytes
-        discriminator = data[:8]
-        print(f"Discriminator: {discriminator.hex()}")
-        
-        # After discriminator comes the arguments
-        # record_job(job_hash: String, duration_sec: u64, complexity_fixed: u32)
-        
-        offset = 8
-        
-        # String is: 4 bytes length (u32 LE) + bytes
         if len(data) > offset + 4:
             str_len = struct.unpack('<I', data[offset:offset+4])[0]
             offset += 4
             job_hash = data[offset:offset+str_len].decode('utf-8', errors='ignore')
             offset += str_len
-            print(f"Job hash: {job_hash}")
             
-            # duration_sec: u64 (8 bytes LE)
             if len(data) >= offset + 8:
                 duration_sec = struct.unpack('<Q', data[offset:offset+8])[0]
                 offset += 8
-                print(f"Duration: {duration_sec}")
                 
-                # complexity_fixed: u32 (4 bytes LE)
                 if len(data) >= offset + 4:
                     complexity_fixed = struct.unpack('<I', data[offset:offset+4])[0]
-                    print(f"Complexity fixed: {complexity_fixed}")
                     
                     return {
                         'job_hash': job_hash,
                         'duration_seconds': duration_sec,
                         'complexity_fixed': complexity_fixed,
-                        'complexity_claimed': complexity_fixed / 1000.0  # Convert from fixed
+                        'complexity_claimed': complexity_fixed / 1000.0
                     }
-        
         return None
     except Exception as e:
         print(f"Decode error: {e}")
         return None
 
-def call_update_trust(machine_pubkey, job_hash, ml_confidence, trust_delta):
-    """Call update_trust on Solana (async, fire-and-forget for now)"""
+def call_update_trust(machine_pubkey, job_pubkey, job_hash, ml_confidence, trust_delta):
+    """Call update_trust on Solana"""
     try:
-        if not ORACLE_PRIVATE_KEY:
-            print("No oracle key configured - skipping on-chain update")
+        if not oracle_keypair:
+            print("No oracle key configured")
             return {'status': 'skipped', 'reason': 'no_oracle_key'}
         
-        # TODO: Implement actual Solana transaction
-        # For now, just log what we would do
-        print(f"Would call update_trust:")
-        print(f"  Machine: {machine_pubkey}")
-        print(f"  Job: {job_hash}")
-        print(f"  ML Confidence: {ml_confidence}")
-        print(f"  Trust Delta: {trust_delta}")
+        if not STATE_ACCOUNT:
+            print("No state account configured")
+            return {'status': 'skipped', 'reason': 'no_state_account'}
         
-        return {'status': 'pending', 'reason': 'not_implemented_yet'}
+        # Import solana libraries
+        from solders.keypair import Keypair
+        from solders.pubkey import Pubkey
+        from solders.instruction import Instruction, AccountMeta
+        from solders.transaction import Transaction
+        from solders.message import Message
+        from solders.hash import Hash
+        from solana.rpc.api import Client
+        import hashlib
+        
+        client = Client(SOLANA_RPC)
+        
+        # Create keypair from bytes
+        oracle = Keypair.from_bytes(oracle_keypair)
+        print(f"Oracle pubkey: {oracle.pubkey()}")
+        
+        # Derive PDAs
+        program_id = Pubkey.from_string(PROGRAM_ID)
+        state_pubkey = Pubkey.from_string(STATE_ACCOUNT)
+        machine_pubkey_obj = Pubkey.from_string(machine_pubkey)
+        job_pubkey_obj = Pubkey.from_string(job_pubkey)
+        
+        # Machine state PDA
+        machine_state_pda, machine_bump = Pubkey.find_program_address(
+            [b"machine", bytes(machine_pubkey_obj)],
+            program_id
+        )
+        
+        # Job PDA (already have the pubkey from the transaction)
+        
+        # Build instruction data
+        # Discriminator for update_trust (first 8 bytes of sha256("global:update_trust"))
+        discriminator = hashlib.sha256(b"global:update_trust").digest()[:8]
+        
+        # Arguments: job_hash (String), ml_confidence (u32), trust_delta (i32)
+        job_hash_bytes = job_hash.encode('utf-8')
+        instruction_data = (
+            discriminator +
+            struct.pack('<I', len(job_hash_bytes)) +
+            job_hash_bytes +
+            struct.pack('<I', ml_confidence) +
+            struct.pack('<i', trust_delta)
+        )
+        
+        # Build instruction
+        accounts = [
+            AccountMeta(state_pubkey, is_signer=False, is_writable=False),
+            AccountMeta(machine_state_pda, is_signer=False, is_writable=True),
+            AccountMeta(job_pubkey_obj, is_signer=False, is_writable=True),
+            AccountMeta(oracle.pubkey(), is_signer=True, is_writable=False),
+        ]
+        
+        instruction = Instruction(program_id, instruction_data, accounts)
+        
+        # Get recent blockhash
+        blockhash_resp = client.get_latest_blockhash()
+        recent_blockhash = blockhash_resp.value.blockhash
+        
+        # Build and sign transaction
+        message = Message.new_with_blockhash(
+            [instruction],
+            oracle.pubkey(),
+            recent_blockhash
+        )
+        tx = Transaction.new_unsigned(message)
+        tx.sign([oracle], recent_blockhash)
+        
+        # Send transaction
+        result = client.send_transaction(tx)
+        
+        print(f"update_trust tx sent: {result.value}")
+        
+        return {
+            'status': 'sent',
+            'signature': str(result.value),
+            'machine': machine_pubkey,
+            'trust_delta': trust_delta
+        }
         
     except Exception as e:
         print(f"update_trust error: {e}")
+        import traceback
+        traceback.print_exc()
         return {'status': 'error', 'reason': str(e)}
 
 @app.route('/health')
@@ -206,7 +273,8 @@ def health():
         'version': config.get('version'),
         'machines': len(machine_history), 
         'jobs': len(network_stats['complexities']),
-        'oracle_configured': ORACLE_PRIVATE_KEY is not None
+        'oracle_configured': oracle_keypair is not None,
+        'state_configured': bool(STATE_ACCOUNT)
     })
 
 @app.route('/predict', methods=['POST'])
@@ -226,7 +294,6 @@ def predict():
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """Helius webhook endpoint - receives JobRecorded events"""
     try:
         payload = request.json
         
@@ -244,7 +311,6 @@ def webhook():
             signature = tx.get('signature', 'unknown')
             print(f"Processing tx: {signature[:20]}...")
             
-            # Extract job data
             job_data = extract_job_data(tx)
             
             if job_data:
@@ -252,11 +318,11 @@ def webhook():
                 result = score_job(job_data)
                 result['job_hash'] = job_data.get('job_hash')
                 result['machine_id'] = job_data.get('machine_id')
+                result['job_pubkey'] = job_data.get('job_pubkey')
                 result['signature'] = signature
                 result['duration_seconds'] = job_data.get('duration_seconds')
                 result['complexity_claimed'] = job_data.get('complexity_claimed')
                 
-                # Store for inspection
                 scored_jobs.append({
                     'timestamp': datetime.now().isoformat(),
                     **result
@@ -267,6 +333,7 @@ def webhook():
                 # Call update_trust on-chain
                 trust_result = call_update_trust(
                     job_data.get('machine_id'),
+                    job_data.get('job_pubkey'),
                     job_data.get('job_hash'),
                     int(result['confidence'] * 1000),
                     result['trust_delta']
@@ -289,8 +356,6 @@ def webhook():
         return jsonify({'error': str(e)}), 500
 
 def extract_job_data(tx):
-    """Extract job data from Helius transaction"""
-    
     instructions = tx.get('instructions', [])
     
     for ix in instructions:
@@ -299,12 +364,10 @@ def extract_job_data(tx):
             accounts = ix.get('accounts', [])
             data_b58 = ix.get('data', '')
             
-            # accounts for record_job: [state, machine_state, job, machine, payer, system]
             if len(accounts) >= 4:
                 machine_pubkey = accounts[3] if len(accounts) > 3 else None
                 job_pubkey = accounts[2] if len(accounts) > 2 else None
                 
-                # Decode instruction data
                 decoded = decode_record_job_instruction(data_b58)
                 
                 if decoded:
@@ -314,15 +377,15 @@ def extract_job_data(tx):
                         'job_pubkey': str(job_pubkey),
                         'duration_seconds': decoded.get('duration_seconds', 300),
                         'complexity_claimed': decoded.get('complexity_claimed', 1.0),
-                        'reward_gross': 5.0,  # Will calculate from duration/complexity
+                        'reward_gross': 5.0,
                         'activity_ratio': 1.0,
                         'decay_multiplier': 1.0
                     }
                 else:
-                    # Fallback to defaults if decode fails
                     return {
                         'machine_id': str(machine_pubkey),
                         'job_hash': str(job_pubkey),
+                        'job_pubkey': str(job_pubkey),
                         'duration_seconds': 300,
                         'complexity_claimed': 1.0,
                         'reward_gross': 5.0,
@@ -344,15 +407,13 @@ def stats():
 
 @app.route('/recent-scores')
 def recent_scores():
-    """View recently scored jobs"""
     return jsonify({
         'count': len(scored_jobs),
-        'jobs': scored_jobs[-20:]  # Last 20
+        'jobs': scored_jobs[-20:]
     })
 
 @app.route('/machine/<machine_id>')
 def machine_info(machine_id):
-    """Get machine history and stats"""
     h = machine_history.get(machine_id, {})
     if not h:
         return jsonify({'error': 'Machine not found'}), 404
@@ -363,8 +424,6 @@ def machine_info(machine_id):
         'total_earned': h.get('total_earned', 0),
         'avg_complexity': np.mean(h.get('complexities', [1.0])) if h.get('complexities') else 1.0,
         'avg_duration': np.mean(h.get('durations', [300])) if h.get('durations') else 300,
-        'recent_complexities': h.get('complexities', [])[-10:],
-        'recent_durations': h.get('durations', [])[-10:]
     })
 
 @app.route('/test-webhook', methods=['POST'])
