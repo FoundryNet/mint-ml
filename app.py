@@ -4,6 +4,9 @@ import json
 import numpy as np
 from datetime import datetime
 from collections import defaultdict
+import base58
+import struct
+import os
 
 app = Flask(__name__)
 
@@ -15,11 +18,19 @@ with open('model_features.json', 'r') as f:
 
 print(f"Model loaded. {len(feature_list)} features.")
 
+# Program ID
+PROGRAM_ID = 'AyFBC6DBStSbrau3wfFZzsX5rX14nx8Gkp8TqF687F5X'
+
+# Oracle keypair for signing update_trust transactions
+# In production, load from environment variable
+ORACLE_PRIVATE_KEY = os.environ.get('ORACLE_PRIVATE_KEY', None)
+
 machine_history = defaultdict(lambda: {
     'job_count': 0, 'total_earned': 0, 
     'complexities': [], 'durations': []
 })
 network_stats = {'complexities': [], 'durations': []}
+scored_jobs = []  # Store recent scores for inspection
 
 def get_network_stats():
     if not network_stats['complexities']:
@@ -120,13 +131,82 @@ def score_job(data):
         'action': action
     }
 
+def decode_record_job_instruction(data_b58):
+    """Decode record_job instruction data from base58"""
+    try:
+        data = base58.b58decode(data_b58)
+        print(f"Decoded bytes length: {len(data)}")
+        print(f"Decoded bytes hex: {data.hex()}")
+        
+        # Anchor discriminator is first 8 bytes
+        discriminator = data[:8]
+        print(f"Discriminator: {discriminator.hex()}")
+        
+        # After discriminator comes the arguments
+        # record_job(job_hash: String, duration_sec: u64, complexity_fixed: u32)
+        
+        offset = 8
+        
+        # String is: 4 bytes length (u32 LE) + bytes
+        if len(data) > offset + 4:
+            str_len = struct.unpack('<I', data[offset:offset+4])[0]
+            offset += 4
+            job_hash = data[offset:offset+str_len].decode('utf-8', errors='ignore')
+            offset += str_len
+            print(f"Job hash: {job_hash}")
+            
+            # duration_sec: u64 (8 bytes LE)
+            if len(data) >= offset + 8:
+                duration_sec = struct.unpack('<Q', data[offset:offset+8])[0]
+                offset += 8
+                print(f"Duration: {duration_sec}")
+                
+                # complexity_fixed: u32 (4 bytes LE)
+                if len(data) >= offset + 4:
+                    complexity_fixed = struct.unpack('<I', data[offset:offset+4])[0]
+                    print(f"Complexity fixed: {complexity_fixed}")
+                    
+                    return {
+                        'job_hash': job_hash,
+                        'duration_seconds': duration_sec,
+                        'complexity_fixed': complexity_fixed,
+                        'complexity_claimed': complexity_fixed / 1000.0  # Convert from fixed
+                    }
+        
+        return None
+    except Exception as e:
+        print(f"Decode error: {e}")
+        return None
+
+def call_update_trust(machine_pubkey, job_hash, ml_confidence, trust_delta):
+    """Call update_trust on Solana (async, fire-and-forget for now)"""
+    try:
+        if not ORACLE_PRIVATE_KEY:
+            print("No oracle key configured - skipping on-chain update")
+            return {'status': 'skipped', 'reason': 'no_oracle_key'}
+        
+        # TODO: Implement actual Solana transaction
+        # For now, just log what we would do
+        print(f"Would call update_trust:")
+        print(f"  Machine: {machine_pubkey}")
+        print(f"  Job: {job_hash}")
+        print(f"  ML Confidence: {ml_confidence}")
+        print(f"  Trust Delta: {trust_delta}")
+        
+        return {'status': 'pending', 'reason': 'not_implemented_yet'}
+        
+    except Exception as e:
+        print(f"update_trust error: {e}")
+        return {'status': 'error', 'reason': str(e)}
+
 @app.route('/health')
 def health():
     return jsonify({
         'status': 'healthy', 
         'version': config.get('version'),
         'machines': len(machine_history), 
-        'jobs': len(network_stats['complexities'])
+        'jobs': len(network_stats['complexities']),
+        'oracle_configured': ORACLE_PRIVATE_KEY is not None
     })
 
 @app.route('/predict', methods=['POST'])
@@ -150,73 +230,51 @@ def webhook():
     try:
         payload = request.json
         
-        # Log FULL payload for debugging
         print("=" * 60)
         print("WEBHOOK RECEIVED")
-        print("=" * 60)
-        print(json.dumps(payload, indent=2))
         print("=" * 60)
         
         if not payload:
             return jsonify({'status': 'no payload'}), 200
         
-        # Helius sends array of transactions
         transactions = payload if isinstance(payload, list) else [payload]
         
         results = []
         for tx in transactions:
-            print(f"\n--- Processing TX ---")
-            print(f"Keys in tx: {list(tx.keys())}")
-            
-            # Get signature
             signature = tx.get('signature', 'unknown')
-            print(f"Signature: {signature}")
+            print(f"Processing tx: {signature[:20]}...")
             
-            # Look for events (Anchor programs emit events here)
-            events = tx.get('events', {})
-            print(f"Events: {events}")
-            
-            # Look for instructions
-            instructions = tx.get('instructions', [])
-            print(f"Instructions count: {len(instructions)}")
-            for i, ix in enumerate(instructions):
-                print(f"  Instruction {i}: {ix.get('programId', 'unknown')[:20]}...")
-                if 'data' in ix:
-                    print(f"    Data: {ix['data'][:50]}...")
-                if 'accounts' in ix:
-                    print(f"    Accounts: {len(ix['accounts'])} accounts")
-            
-            # Look for inner instructions
-            inner = tx.get('innerInstructions', [])
-            print(f"Inner instructions: {len(inner)}")
-            
-            # Look for logs
-            log_messages = tx.get('logMessages', [])
-            print(f"Log messages: {len(log_messages)}")
-            for log in log_messages[:10]:
-                print(f"  {log[:100]}")
-            
-            # Look for native transfers
-            native = tx.get('nativeTransfers', [])
-            print(f"Native transfers: {len(native)}")
-            
-            # Look for token transfers  
-            token = tx.get('tokenTransfers', [])
-            print(f"Token transfers: {len(token)}")
-            
-            # Try to extract job data from various places
+            # Extract job data
             job_data = extract_job_data(tx)
             
             if job_data:
-                print(f"\n>>> EXTRACTED JOB DATA: {job_data}")
+                print(f"Job data: {job_data}")
                 result = score_job(job_data)
-                result['job_hash'] = job_data.get('job_hash', signature[:32])
+                result['job_hash'] = job_data.get('job_hash')
                 result['machine_id'] = job_data.get('machine_id')
                 result['signature'] = signature
+                result['duration_seconds'] = job_data.get('duration_seconds')
+                result['complexity_claimed'] = job_data.get('complexity_claimed')
+                
+                # Store for inspection
+                scored_jobs.append({
+                    'timestamp': datetime.now().isoformat(),
+                    **result
+                })
+                if len(scored_jobs) > 100:
+                    scored_jobs.pop(0)
+                
+                # Call update_trust on-chain
+                trust_result = call_update_trust(
+                    job_data.get('machine_id'),
+                    job_data.get('job_hash'),
+                    int(result['confidence'] * 1000),
+                    result['trust_delta']
+                )
+                result['trust_update'] = trust_result
+                
                 results.append(result)
-                print(f">>> SCORED: {result}")
-            else:
-                print(">>> No job data extracted")
+                print(f"SCORED: {result}")
         
         return jsonify({
             'status': 'processed',
@@ -233,59 +291,44 @@ def webhook():
 def extract_job_data(tx):
     """Extract job data from Helius transaction"""
     
-    # Method 1: Check for parsed events (Anchor events)
-    events = tx.get('events', {})
-    if events:
-        # Look for our JobRecorded event
-        program_events = events.get('nft', events.get('swap', events.get('compressed', None)))
-        if program_events:
-            print(f"Found program events: {program_events}")
-    
-    # Method 2: Parse from account data changes
-    account_data = tx.get('accountData', [])
-    for acc in account_data:
-        account = acc.get('account', '')
-        # Look for job account (newly created accounts have balance change)
-        if acc.get('nativeBalanceChange', 0) < 0:
-            print(f"Account with balance change: {account}")
-    
-    # Method 3: Parse from instructions
     instructions = tx.get('instructions', [])
-    our_program = 'AyFBC6DBStSbrau3wfFZzsX5rX14nx8Gkp8TqF687F5X'
     
     for ix in instructions:
         program_id = ix.get('programId', '')
-        if program_id == our_program:
-            print(f"Found our program instruction!")
+        if program_id == PROGRAM_ID:
             accounts = ix.get('accounts', [])
-            data = ix.get('data', '')
+            data_b58 = ix.get('data', '')
             
             # accounts for record_job: [state, machine_state, job, machine, payer, system]
             if len(accounts) >= 4:
                 machine_pubkey = accounts[3] if len(accounts) > 3 else None
                 job_pubkey = accounts[2] if len(accounts) > 2 else None
                 
-                print(f"Machine: {machine_pubkey}")
-                print(f"Job: {job_pubkey}")
-                print(f"Instruction data: {data}")
+                # Decode instruction data
+                decoded = decode_record_job_instruction(data_b58)
                 
-                # Decode instruction data (base58 encoded)
-                # For now, use test values - we'll decode properly next
-                return {
-                    'machine_id': str(machine_pubkey),
-                    'job_hash': str(job_pubkey),
-                    'duration_seconds': 300,
-                    'complexity_claimed': 1.0,
-                    'reward_gross': 5.0,
-                    'activity_ratio': 1.0,
-                    'decay_multiplier': 1.0
-                }
-    
-    # Method 4: Check inner instructions
-    for inner in tx.get('innerInstructions', []):
-        for ix in inner.get('instructions', []):
-            if ix.get('programId', '') == our_program:
-                print(f"Found our program in inner instructions")
+                if decoded:
+                    return {
+                        'machine_id': str(machine_pubkey),
+                        'job_hash': decoded.get('job_hash', str(job_pubkey)),
+                        'job_pubkey': str(job_pubkey),
+                        'duration_seconds': decoded.get('duration_seconds', 300),
+                        'complexity_claimed': decoded.get('complexity_claimed', 1.0),
+                        'reward_gross': 5.0,  # Will calculate from duration/complexity
+                        'activity_ratio': 1.0,
+                        'decay_multiplier': 1.0
+                    }
+                else:
+                    # Fallback to defaults if decode fails
+                    return {
+                        'machine_id': str(machine_pubkey),
+                        'job_hash': str(job_pubkey),
+                        'duration_seconds': 300,
+                        'complexity_claimed': 1.0,
+                        'reward_gross': 5.0,
+                        'activity_ratio': 1.0,
+                        'decay_multiplier': 1.0
+                    }
     
     return None
 
@@ -297,6 +340,31 @@ def stats():
         'network_avg_duration': net['avg_d'],
         'machines': len(machine_history),
         'jobs': len(network_stats['complexities'])
+    })
+
+@app.route('/recent-scores')
+def recent_scores():
+    """View recently scored jobs"""
+    return jsonify({
+        'count': len(scored_jobs),
+        'jobs': scored_jobs[-20:]  # Last 20
+    })
+
+@app.route('/machine/<machine_id>')
+def machine_info(machine_id):
+    """Get machine history and stats"""
+    h = machine_history.get(machine_id, {})
+    if not h:
+        return jsonify({'error': 'Machine not found'}), 404
+    
+    return jsonify({
+        'machine_id': machine_id,
+        'job_count': h.get('job_count', 0),
+        'total_earned': h.get('total_earned', 0),
+        'avg_complexity': np.mean(h.get('complexities', [1.0])) if h.get('complexities') else 1.0,
+        'avg_duration': np.mean(h.get('durations', [300])) if h.get('durations') else 300,
+        'recent_complexities': h.get('complexities', [])[-10:],
+        'recent_durations': h.get('durations', [])[-10:]
     })
 
 @app.route('/test-webhook', methods=['POST'])
