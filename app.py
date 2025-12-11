@@ -26,10 +26,20 @@ print(f"Model loaded. {len(feature_list)} features.")
 
 # ============ Configuration ============
 
-PROGRAM_ID = os.environ.get('PROGRAM_ID', 'AyFBC6DBStSbrau3wfFZzsX5rX14nx8Gkp8TqF687F5X')
-STATE_ACCOUNT = os.environ.get('STATE_ACCOUNT', '')
-SOLANA_RPC = os.environ.get('SOLANA_RPC', 'https://api.devnet.solana.com')
+PROGRAM_ID = os.environ.get('PROGRAM_ID', '4ZvTZ3skfeMF3ZGyABoazPa9tiudw2QSwuVKn45t2AKL')
+STATE_ACCOUNT = os.environ.get('STATE_ACCOUNT', '2Lm7hrtqK9W5tykVu4U37nUNJiiFh6WQ1rD8ZJWXomr2')
+SOLANA_RPC = os.environ.get('SOLANA_RPC', 'https://mainnet.helius-rpc.com/?api-key=2c13462d-4a64-4c5b-b410-1520219d73aa')
 ORACLE_PRIVATE_KEY = os.environ.get('ORACLE_PRIVATE_KEY', '')
+
+# Token addresses (mainnet)
+MINT_TOKEN = os.environ.get('MINT_TOKEN', '5Pd4YBgFdih88vAFGAEEsk2JpixrZDJpRynTWvqPy5da')
+GENESIS_TREASURY_ATA = os.environ.get('GENESIS_TREASURY_ATA', 'JYkvEAiSmPTXMp1KDmgk9LLZVgNRU7oxXEw3L7veu2z')
+PERSONAL_FEE_ATA = os.environ.get('PERSONAL_FEE_ATA', 'CWWXT7dkMrYCraZqffgG1Fk87ZWhqNGEznLfg9B5eRmU')
+PROTOCOL_FEE_ATA = os.environ.get('PROTOCOL_FEE_ATA', 'Hd1usKUanHb5zjryZrr3iGujFJHq4Tcg3Frpsrejq2L5')
+
+# SPL Token Program
+TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
+ASSOCIATED_TOKEN_PROGRAM_ID = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL'
 
 oracle_keypair = None
 if ORACLE_PRIVATE_KEY:
@@ -287,6 +297,21 @@ def decode_record_job_instruction(data_b58):
     except:
         return None
 
+def get_associated_token_address(owner_pubkey, mint_pubkey):
+    """Derive the associated token address for an owner and mint"""
+    from solders.pubkey import Pubkey
+    owner = Pubkey.from_string(owner_pubkey) if isinstance(owner_pubkey, str) else owner_pubkey
+    mint = Pubkey.from_string(mint_pubkey) if isinstance(mint_pubkey, str) else mint_pubkey
+    token_program = Pubkey.from_string(TOKEN_PROGRAM_ID)
+    ata_program = Pubkey.from_string(ASSOCIATED_TOKEN_PROGRAM_ID)
+    
+    # ATA is a PDA derived from [owner, token_program, mint]
+    ata, _ = Pubkey.find_program_address(
+        [bytes(owner), bytes(token_program), bytes(mint)],
+        ata_program
+    )
+    return ata
+
 def call_update_trust(machine_pubkey, job_pubkey, job_hash, ml_confidence, trust_delta):
     try:
         if not oracle_keypair or not STATE_ACCOUNT:
@@ -312,7 +337,7 @@ def call_update_trust(machine_pubkey, job_pubkey, job_hash, ml_confidence, trust
         instruction_data = (
             discriminator +
             struct.pack('<I', len(job_hash_bytes)) + job_hash_bytes +
-            struct.pack('<I', ml_confidence) + struct.pack('<i', trust_delta)
+            struct.pack('<I', ml_confidence) + struct.pack('<b', trust_delta)
         )
         accounts = [
             AccountMeta(state_pubkey, is_signer=False, is_writable=False),
@@ -330,20 +355,103 @@ def call_update_trust(machine_pubkey, job_pubkey, job_hash, ml_confidence, trust
     except Exception as e:
         if 'AccountNotInitialized' in str(e):
             return {'status': 'skipped', 'reason': 'machine_not_registered'}
-        return {'status': 'error', 'reason': str(e)[:100]}
+        return {'status': 'error', 'reason': str(e)[:200]}
+
+def call_settle_job(machine_pubkey, job_pubkey, owner_pubkey):
+    """Call settle_job to distribute MINT tokens"""
+    try:
+        if not oracle_keypair or not STATE_ACCOUNT:
+            return {'status': 'skipped', 'reason': 'no_config'}
+        
+        from solders.keypair import Keypair
+        from solders.pubkey import Pubkey
+        from solders.instruction import Instruction, AccountMeta
+        from solders.transaction import Transaction
+        from solders.message import Message
+        from solana.rpc.api import Client
+        import hashlib
+        
+        client = Client(SOLANA_RPC)
+        oracle = Keypair.from_bytes(oracle_keypair)
+        program_id = Pubkey.from_string(PROGRAM_ID)
+        state_pubkey = Pubkey.from_string(STATE_ACCOUNT)
+        machine_pubkey_obj = Pubkey.from_string(machine_pubkey)
+        job_pubkey_obj = Pubkey.from_string(job_pubkey)
+        mint_pubkey = Pubkey.from_string(MINT_TOKEN)
+        genesis_treasury_ata = Pubkey.from_string(GENESIS_TREASURY_ATA)
+        personal_fee_ata = Pubkey.from_string(PERSONAL_FEE_ATA)
+        protocol_fee_ata = Pubkey.from_string(PROTOCOL_FEE_ATA)
+        token_program = Pubkey.from_string(TOKEN_PROGRAM_ID)
+        
+        # Derive PDAs
+        machine_state_pda, _ = Pubkey.find_program_address(
+            [b"machine", bytes(machine_pubkey_obj)], program_id
+        )
+        genesis_authority_pda, _ = Pubkey.find_program_address(
+            [b"genesis_authority"], program_id
+        )
+        mint_authority_pda, _ = Pubkey.find_program_address(
+            [b"mint_authority"], program_id
+        )
+        
+        # Get owner's MINT token account (ATA)
+        owner_pubkey_obj = Pubkey.from_string(owner_pubkey)
+        owner_token_account = get_associated_token_address(owner_pubkey_obj, mint_pubkey)
+        
+        # Build instruction
+        discriminator = hashlib.sha256(b"global:settle_job").digest()[:8]
+        
+        # SettleJob accounts (must match Rust struct order):
+        # 1. state (mut)
+        # 2. machine_state (mut, PDA)
+        # 3. job (mut)
+        # 4. mint (mut)
+        # 5. genesis_treasury_ata (mut)
+        # 6. genesis_authority (PDA)
+        # 7. owner_token_account (mut)
+        # 8. personal_fee_token_account (mut)
+        # 9. protocol_fee_token_account (mut)
+        # 10. mint_authority (PDA)
+        # 11. token_program
+        
+        accounts = [
+            AccountMeta(state_pubkey, is_signer=False, is_writable=True),
+            AccountMeta(machine_state_pda, is_signer=False, is_writable=True),
+            AccountMeta(job_pubkey_obj, is_signer=False, is_writable=True),
+            AccountMeta(mint_pubkey, is_signer=False, is_writable=True),
+            AccountMeta(genesis_treasury_ata, is_signer=False, is_writable=True),
+            AccountMeta(genesis_authority_pda, is_signer=False, is_writable=False),
+            AccountMeta(owner_token_account, is_signer=False, is_writable=True),
+            AccountMeta(personal_fee_ata, is_signer=False, is_writable=True),
+            AccountMeta(protocol_fee_ata, is_signer=False, is_writable=True),
+            AccountMeta(mint_authority_pda, is_signer=False, is_writable=False),
+            AccountMeta(token_program, is_signer=False, is_writable=False),
+        ]
+        
+        instruction = Instruction(program_id, discriminator, accounts)
+        blockhash_resp = client.get_latest_blockhash()
+        message = Message.new_with_blockhash([instruction], oracle.pubkey(), blockhash_resp.value.blockhash)
+        tx = Transaction.new_unsigned(message)
+        tx.sign([oracle], blockhash_resp.value.blockhash)
+        result = client.send_transaction(tx)
+        
+        return {'status': 'sent', 'signature': str(result.value)}
+    except Exception as e:
+        return {'status': 'error', 'reason': str(e)[:200]}
 
 def extract_job_data(tx):
     instructions = tx.get('instructions', [])
     for ix in instructions:
         if ix.get('programId', '') == PROGRAM_ID:
             accounts = ix.get('accounts', [])
-            if len(accounts) >= 4:
+            if len(accounts) >= 5:
                 decoded = decode_record_job_instruction(ix.get('data', ''))
                 if decoded:
                     return {
-                        'machine_id': str(accounts[3]),
+                        'machine_id': str(accounts[3]),  # machine signer
+                        'owner_id': str(accounts[4]),     # payer/owner
                         'job_hash': decoded.get('job_hash'),
-                        'job_pubkey': str(accounts[2]),
+                        'job_pubkey': str(accounts[2]),   # job PDA
                         'duration_seconds': decoded.get('duration_seconds', 300),
                         'complexity_claimed': decoded.get('complexity_claimed', 1.0),
                     }
@@ -364,7 +472,8 @@ def health():
         'total_mint_minted': round(network_stats['total_mint_minted'], 2),
         'disputes': len(community_disputes),
         'oracle_configured': oracle_keypair is not None,
-        'state_configured': bool(STATE_ACCOUNT)
+        'state_configured': bool(STATE_ACCOUNT),
+        'settle_enabled': True
     })
 
 @app.route('/webhook', methods=['POST'])
@@ -382,6 +491,7 @@ def webhook():
                 result = score_job(job_data)
                 result['job_hash'] = job_data.get('job_hash')
                 result['machine_id'] = job_data.get('machine_id')
+                result['owner_id'] = job_data.get('owner_id')
                 result['job_pubkey'] = job_data.get('job_pubkey')
                 result['signature'] = signature
                 result['duration_seconds'] = job_data.get('duration_seconds')
@@ -389,6 +499,8 @@ def webhook():
                 scored_jobs.append({'timestamp': datetime.now().isoformat(), **result})
                 if len(scored_jobs) > 1000:
                     scored_jobs.pop(0)
+                
+                # Step 1: Update trust score on-chain
                 trust_result = call_update_trust(
                     job_data.get('machine_id'),
                     job_data.get('job_pubkey'),
@@ -397,6 +509,22 @@ def webhook():
                     result['trust_delta']
                 )
                 result['trust_update'] = trust_result
+                
+                # Step 2: Settle job and distribute MINT (if trust update succeeded)
+                if trust_result.get('status') == 'sent':
+                    # Small delay to let trust update confirm
+                    time.sleep(1)
+                    settle_result = call_settle_job(
+                        job_data.get('machine_id'),
+                        job_data.get('job_pubkey'),
+                        job_data.get('owner_id')
+                    )
+                    result['settle'] = settle_result
+                    if settle_result.get('status') == 'sent':
+                        print(f"[SETTLE] TX: {settle_result.get('signature', 'unknown')[:16]}...")
+                else:
+                    result['settle'] = {'status': 'skipped', 'reason': 'trust_update_failed'}
+                
                 econ = result['economics']
                 print(f"[MINT] #{econ['network_jobs']} | {job_data.get('machine_id','')[:8]}... | "
                       f"{econ['duration_seconds']}s @ {econ['complexity_claimed']:.2f} | "
