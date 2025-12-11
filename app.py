@@ -509,6 +509,7 @@ def webhook():
                     result['trust_delta']
                 )
                 result['trust_update'] = trust_result
+                print(f"[DEBUG] trust_result: {trust_result}")
                 
                 # Step 2: Settle job and distribute MINT (if trust update succeeded)
                 if trust_result.get('status') == 'sent':
@@ -520,6 +521,7 @@ def webhook():
                         job_data.get('owner_id')
                     )
                     result['settle'] = settle_result
+                    print(f"[DEBUG] settle_result: {settle_result}")
                     if settle_result.get('status') == 'sent':
                         print(f"[SETTLE] TX: {settle_result.get('signature', 'unknown')[:16]}...")
                 else:
