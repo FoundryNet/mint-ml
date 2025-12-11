@@ -353,6 +353,7 @@ def call_update_trust(machine_pubkey, job_pubkey, job_hash, ml_confidence, trust
         result = client.send_transaction(tx)
         return {'status': 'sent', 'signature': str(result.value)}
     except Exception as e:
+        print(f'[DEBUG] update_trust error: {e}')
         if 'AccountNotInitialized' in str(e):
             return {'status': 'skipped', 'reason': 'machine_not_registered'}
         return {'status': 'error', 'reason': str(e)[:200]}
