@@ -509,6 +509,9 @@ def webhook():
                     scored_jobs.pop(0)
                 
                 # Step 1: Update trust score on-chain
+                # Wait for job to be confirmed on-chain
+                print("[DEBUG] Waiting 3s for job confirmation...")
+                time.sleep(3)
                 trust_result = call_update_trust(
                     job_data.get('machine_id'),
                     job_data.get('job_pubkey'),
