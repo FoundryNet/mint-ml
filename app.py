@@ -441,6 +441,7 @@ def call_settle_job(machine_pubkey, job_pubkey, owner_pubkey):
         return {'status': 'error', 'reason': str(e)[:200]}
 
 def extract_job_data(tx):
+    from solders.pubkey import Pubkey
     instructions = tx.get('instructions', [])
     for ix in instructions:
         if ix.get('programId', '') == PROGRAM_ID:
@@ -448,11 +449,17 @@ def extract_job_data(tx):
             if len(accounts) >= 5:
                 decoded = decode_record_job_instruction(ix.get('data', ''))
                 if decoded:
+                    job_hash = decoded.get('job_hash')
+                    program_id = Pubkey.from_string(PROGRAM_ID)
+                    job_pda, _ = Pubkey.find_program_address(
+                        [b"job", job_hash.encode()], program_id
+                    )
+                    print(f"[DEBUG] job_hash: {job_hash}, derived job_pda: {job_pda}")
                     return {
-                        'machine_id': str(accounts[3]),  # machine signer
-                        'owner_id': str(accounts[4]),     # payer/owner
-                        'job_hash': decoded.get('job_hash'),
-                        'job_pubkey': str(accounts[2]),   # job PDA
+                        'machine_id': str(accounts[3]),
+                        'owner_id': str(accounts[4]),
+                        'job_hash': job_hash,
+                        'job_pubkey': str(job_pda),
                         'duration_seconds': decoded.get('duration_seconds', 300),
                         'complexity_claimed': decoded.get('complexity_claimed', 1.0),
                     }
