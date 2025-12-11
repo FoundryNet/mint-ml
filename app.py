@@ -525,7 +525,7 @@ def webhook():
                 # Step 2: Settle job and distribute MINT (if trust update succeeded)
                 if trust_result.get('status') == 'sent':
                     # Small delay to let trust update confirm
-                    time.sleep(1)
+                    time.sleep(5)
                     settle_result = call_settle_job(
                         job_data.get('machine_id'),
                         job_data.get('job_pubkey'),
