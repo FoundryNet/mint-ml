@@ -351,7 +351,16 @@ def call_update_trust(machine_pubkey, job_pubkey, job_hash, ml_confidence, trust
         tx = Transaction.new_unsigned(message)
         tx.sign([oracle], blockhash_resp.value.blockhash)
         result = client.send_transaction(tx)
-        return {'status': 'sent', 'signature': str(result.value)}
+        sig = result.value
+        # Wait for confirmation
+        print(f"[DEBUG] Waiting for trust TX confirmation: {sig}")
+        try:
+            client.confirm_transaction(sig, commitment='confirmed')
+            print(f"[DEBUG] Trust TX confirmed!")
+            return {'status': 'confirmed', 'signature': str(sig)}
+        except Exception as confirm_err:
+            print(f"[DEBUG] Confirmation error: {confirm_err}")
+            return {'status': 'sent_unconfirmed', 'signature': str(sig)}
     except Exception as e:
         print(f'[DEBUG] update_trust error: {e}')
         if 'AccountNotInitialized' in str(e):
@@ -523,7 +532,7 @@ def webhook():
                 print(f"[DEBUG] trust_result: {trust_result}")
                 
                 # Step 2: Settle job and distribute MINT (if trust update succeeded)
-                if trust_result.get('status') == 'sent':
+                if trust_result.get('status') in ['sent', 'confirmed', 'sent_unconfirmed']:
                     # Small delay to let trust update confirm
                     time.sleep(5)
                     settle_result = call_settle_job(
