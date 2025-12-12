@@ -380,6 +380,7 @@ def call_settle_job(machine_pubkey, job_pubkey, owner_pubkey):
         from solders.transaction import Transaction
         from solders.message import Message
         from solana.rpc.api import Client
+        from solana.rpc.types import TxOpts
         import hashlib
         
         client = Client(SOLANA_RPC)
