@@ -322,7 +322,6 @@ def call_update_trust(machine_pubkey, job_pubkey, job_hash, ml_confidence, trust
         from solders.transaction import Transaction
         from solders.message import Message
         from solana.rpc.api import Client
-from solana.rpc.types import TxOpts
         import hashlib
         client = Client(SOLANA_RPC)
         oracle = Keypair.from_bytes(oracle_keypair)
@@ -351,7 +350,7 @@ from solana.rpc.types import TxOpts
         message = Message.new_with_blockhash([instruction], oracle.pubkey(), blockhash_resp.value.blockhash)
         tx = Transaction.new_unsigned(message)
         tx.sign([oracle], blockhash_resp.value.blockhash)
-        result = client.send_transaction(tx, opts=TxOpts(skip_preflight=True))
+        result = client.send_transaction(tx)
         sig = result.value
         # Wait for confirmation
         print(f"[DEBUG] Waiting for trust TX confirmation: {sig}")
@@ -380,7 +379,6 @@ def call_settle_job(machine_pubkey, job_pubkey, owner_pubkey):
         from solders.transaction import Transaction
         from solders.message import Message
         from solana.rpc.api import Client
-from solana.rpc.types import TxOpts
         import hashlib
         
         client = Client(SOLANA_RPC)
