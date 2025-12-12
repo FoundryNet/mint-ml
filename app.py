@@ -12,6 +12,7 @@ import time
 import csv
 import io
 import math
+import hashlib
 
 app = Flask(__name__)
 CORS(app)
@@ -22,7 +23,7 @@ with open('model_metadata.json', 'r') as f:
 with open('model_features.json', 'r') as f:
     feature_list = json.load(f)
 
-print(f"Model loaded. {len(feature_list)} features.")
+print(f"[FoundryNet] Model loaded: {len(feature_list)} features")
 
 # ============ Configuration ============
 
@@ -41,14 +42,18 @@ PROTOCOL_FEE_ATA = os.environ.get('PROTOCOL_FEE_ATA', 'Hd1usKUanHb5zjryZrr3iGujF
 TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
 ASSOCIATED_TOKEN_PROGRAM_ID = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL'
 
+# Solscan base URL
+SOLSCAN_TX_URL = 'https://solscan.io/tx/'
+SOLSCAN_ACCOUNT_URL = 'https://solscan.io/account/'
+
 oracle_keypair = None
 if ORACLE_PRIVATE_KEY:
     try:
         key_bytes = json.loads(ORACLE_PRIVATE_KEY)
         oracle_keypair = bytes(key_bytes)
-        print(f"Oracle keypair loaded: {len(oracle_keypair)} bytes")
+        print(f"[FoundryNet] Oracle configured")
     except Exception as e:
-        print(f"Failed to load oracle keypair: {e}")
+        print(f"[FoundryNet] Oracle config error: {e}")
 
 # ============ Economic Constants ============
 
@@ -68,7 +73,8 @@ machine_history = defaultdict(lambda: {
     'complexities': [],
     'durations': [],
     'timestamps': [],
-    'trust_score': 100
+    'trust_score': 100,
+    'transactions': []  # Store recent TX signatures
 })
 
 network_stats = {
@@ -82,6 +88,7 @@ network_stats = {
 
 scored_jobs = []
 community_disputes = []
+processed_jobs = set()  # Deduplication: track processed job hashes
 
 # ============ Economic Functions ============
 
@@ -205,7 +212,7 @@ def build_features(data):
         'earning_rate': h['total_earned'] / (h['job_count'] + 1),
     }
 
-def update_history(mid, c, dur, reward):
+def update_history(mid, c, dur, reward, tx_sig=None):
     now = time.time()
     h = machine_history[mid]
     h['job_count'] += 1
@@ -214,6 +221,10 @@ def update_history(mid, c, dur, reward):
     h['complexities'].append(c)
     h['durations'].append(dur)
     h['timestamps'].append(now)
+    if tx_sig:
+        h['transactions'].append({'sig': tx_sig, 'ts': now, 'reward': reward})
+        if len(h['transactions']) > 100:
+            h['transactions'] = h['transactions'][-100:]
     if len(h['complexities']) > 500:
         h['complexities'] = h['complexities'][-500:]
         h['durations'] = h['durations'][-500:]
@@ -249,7 +260,6 @@ def score_job(data):
     h['trust_score'] = max(0, min(100, old_trust + trust_delta))
     base_result = calculate_base_reward(dur, complexity, h['job_count'])
     final_result = calculate_final_reward(base_result['base_reward'], h['trust_score'], age_days=0)
-    update_history(mid, complexity, dur, final_result['final_reward'])
     return {
         'confidence': confidence,
         'trust_delta': trust_delta,
@@ -298,14 +308,11 @@ def decode_record_job_instruction(data_b58):
         return None
 
 def get_associated_token_address(owner_pubkey, mint_pubkey):
-    """Derive the associated token address for an owner and mint"""
     from solders.pubkey import Pubkey
     owner = Pubkey.from_string(owner_pubkey) if isinstance(owner_pubkey, str) else owner_pubkey
     mint = Pubkey.from_string(mint_pubkey) if isinstance(mint_pubkey, str) else mint_pubkey
     token_program = Pubkey.from_string(TOKEN_PROGRAM_ID)
     ata_program = Pubkey.from_string(ASSOCIATED_TOKEN_PROGRAM_ID)
-    
-    # ATA is a PDA derived from [owner, token_program, mint]
     ata, _ = Pubkey.find_program_address(
         [bytes(owner), bytes(token_program), bytes(mint)],
         ata_program
@@ -323,7 +330,7 @@ def call_update_trust(machine_pubkey, job_pubkey, job_hash, ml_confidence, trust
         from solders.message import Message
         from solana.rpc.api import Client
         from solana.rpc.types import TxOpts
-        import hashlib
+        
         client = Client(SOLANA_RPC)
         oracle = Keypair.from_bytes(oracle_keypair)
         program_id = Pubkey.from_string(PROGRAM_ID)
@@ -353,23 +360,14 @@ def call_update_trust(machine_pubkey, job_pubkey, job_hash, ml_confidence, trust
         tx.sign([oracle], blockhash_resp.value.blockhash)
         result = client.send_transaction(tx, opts=TxOpts(skip_preflight=True))
         sig = result.value
-        # Wait for confirmation
-        print(f"[DEBUG] Waiting for trust TX confirmation: {sig}")
-        try:
-            client.confirm_transaction(sig, commitment='confirmed')
-            print(f"[DEBUG] Trust TX confirmed!")
-            return {'status': 'confirmed', 'signature': str(sig)}
-        except Exception as confirm_err:
-            print(f"[DEBUG] Confirmation error: {confirm_err}")
-            return {'status': 'sent_unconfirmed', 'signature': str(sig)}
+        client.confirm_transaction(sig, commitment='confirmed')
+        return {'status': 'confirmed', 'signature': str(sig)}
     except Exception as e:
-        print(f'[DEBUG] update_trust error: {e}')
-        if 'AccountNotInitialized' in str(e):
-            return {'status': 'skipped', 'reason': 'machine_not_registered'}
+        if 'AlreadyScored' in str(e):
+            return {'status': 'skipped', 'reason': 'already_scored'}
         return {'status': 'error', 'reason': str(e)[:200]}
 
 def call_settle_job(machine_pubkey, job_pubkey, owner_pubkey):
-    """Call settle_job to distribute MINT tokens"""
     try:
         if not oracle_keypair or not STATE_ACCOUNT:
             return {'status': 'skipped', 'reason': 'no_config'}
@@ -381,7 +379,6 @@ def call_settle_job(machine_pubkey, job_pubkey, owner_pubkey):
         from solders.message import Message
         from solana.rpc.api import Client
         from solana.rpc.types import TxOpts
-        import hashlib
         
         client = Client(SOLANA_RPC)
         oracle = Keypair.from_bytes(oracle_keypair)
@@ -395,7 +392,6 @@ def call_settle_job(machine_pubkey, job_pubkey, owner_pubkey):
         protocol_fee_ata = Pubkey.from_string(PROTOCOL_FEE_ATA)
         token_program = Pubkey.from_string(TOKEN_PROGRAM_ID)
         
-        # Derive PDAs
         machine_state_pda, _ = Pubkey.find_program_address(
             [b"machine", bytes(machine_pubkey_obj)], program_id
         )
@@ -406,25 +402,10 @@ def call_settle_job(machine_pubkey, job_pubkey, owner_pubkey):
             [b"mint_authority"], program_id
         )
         
-        # Get owner's MINT token account (ATA)
         owner_pubkey_obj = Pubkey.from_string(owner_pubkey)
         owner_token_account = get_associated_token_address(owner_pubkey_obj, mint_pubkey)
         
-        # Build instruction
         discriminator = hashlib.sha256(b"global:settle_job").digest()[:8]
-        
-        # SettleJob accounts (must match Rust struct order):
-        # 1. state (mut)
-        # 2. machine_state (mut, PDA)
-        # 3. job (mut)
-        # 4. mint (mut)
-        # 5. genesis_treasury_ata (mut)
-        # 6. genesis_authority (PDA)
-        # 7. owner_token_account (mut)
-        # 8. personal_fee_token_account (mut)
-        # 9. protocol_fee_token_account (mut)
-        # 10. mint_authority (PDA)
-        # 11. token_program
         
         accounts = [
             AccountMeta(state_pubkey, is_signer=False, is_writable=True),
@@ -449,11 +430,12 @@ def call_settle_job(machine_pubkey, job_pubkey, owner_pubkey):
         
         return {'status': 'sent', 'signature': str(result.value)}
     except Exception as e:
+        if 'AlreadySettled' in str(e):
+            return {'status': 'skipped', 'reason': 'already_settled'}
         return {'status': 'error', 'reason': str(e)[:200]}
 
 def extract_job_data(tx):
     from solders.pubkey import Pubkey
-    # Try multiple payload formats
     instructions = tx.get('instructions', [])
     
     # Helius raw format - check transaction.message.instructions
@@ -461,8 +443,6 @@ def extract_job_data(tx):
         msg = tx.get('transaction', {}).get('message', {})
         instructions = msg.get('instructions', [])
         account_keys = msg.get('accountKeys', [])
-        print(f"[DEBUG] Found transaction.message with {len(instructions)} instructions")
-        # Convert indexed format to named format
         converted = []
         for ix in instructions:
             prog_idx = ix.get('programIdIndex', -1)
@@ -471,20 +451,20 @@ def extract_job_data(tx):
             converted.append({'programId': prog_id, 'accounts': accts, 'data': ix.get('data', '')})
         instructions = converted
     
-    print(f"[DEBUG] Processing {len(instructions)} instructions")
     for ix in instructions:
-        print(f"[DEBUG] programId: {ix.get('programId', 'NONE')[:20]}...")
         if ix.get('programId', '') == PROGRAM_ID:
             accounts = ix.get('accounts', [])
             if len(accounts) >= 5:
                 decoded = decode_record_job_instruction(ix.get('data', ''))
                 if decoded:
                     job_hash = decoded.get('job_hash')
+                    # Only process RecordJob instructions (not UpdateTrust/SettleJob)
+                    if not job_hash or not job_hash.startswith('job_'):
+                        continue
                     program_id = Pubkey.from_string(PROGRAM_ID)
                     job_pda, _ = Pubkey.find_program_address(
                         [b"job", job_hash.encode()], program_id
                     )
-                    print(f"[DEBUG] job_hash: {job_hash}, derived job_pda: {job_pda}")
                     return {
                         'machine_id': str(accounts[3]),
                         'owner_id': str(accounts[4]),
@@ -511,75 +491,122 @@ def health():
         'disputes': len(community_disputes),
         'oracle_configured': oracle_keypair is not None,
         'state_configured': bool(STATE_ACCOUNT),
-        'settle_enabled': True
+        'program_id': PROGRAM_ID,
+        'network': 'mainnet'
     })
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
     try:
         payload = request.json
-        print(f"[DEBUG] Raw webhook payload: {str(payload)[:500]}")
         if not payload:
             return jsonify({'status': 'no payload'}), 200
+        
         transactions = payload if isinstance(payload, list) else [payload]
         results = []
+        
         for tx in transactions:
             signature = tx.get('signature', 'unknown')
             job_data = extract_job_data(tx)
-            if job_data:
-                result = score_job(job_data)
-                result['job_hash'] = job_data.get('job_hash')
-                result['machine_id'] = job_data.get('machine_id')
-                result['owner_id'] = job_data.get('owner_id')
-                result['job_pubkey'] = job_data.get('job_pubkey')
-                result['signature'] = signature
-                result['duration_seconds'] = job_data.get('duration_seconds')
-                result['complexity_claimed'] = job_data.get('complexity_claimed')
-                scored_jobs.append({'timestamp': datetime.now().isoformat(), **result})
-                if len(scored_jobs) > 1000:
-                    scored_jobs.pop(0)
+            
+            if not job_data:
+                continue
                 
-                # Step 1: Update trust score on-chain
-                # Wait for job to be confirmed on-chain
-                print("[DEBUG] Waiting 3s for job confirmation...")
-                time.sleep(3)
-                trust_result = call_update_trust(
+            job_hash = job_data.get('job_hash')
+            
+            # Deduplication: skip if already processed
+            if job_hash in processed_jobs:
+                continue
+            processed_jobs.add(job_hash)
+            
+            # Keep set bounded
+            if len(processed_jobs) > 10000:
+                processed_jobs.clear()
+            
+            # Score the job
+            result = score_job(job_data)
+            result['job_hash'] = job_hash
+            result['machine_id'] = job_data.get('machine_id')
+            result['owner_id'] = job_data.get('owner_id')
+            result['job_pubkey'] = job_data.get('job_pubkey')
+            result['record_tx'] = signature
+            result['record_tx_url'] = f"{SOLSCAN_TX_URL}{signature}"
+            
+            # Wait for job to be confirmed
+            time.sleep(3)
+            
+            # Update trust on-chain
+            trust_result = call_update_trust(
+                job_data.get('machine_id'),
+                job_data.get('job_pubkey'),
+                job_hash,
+                int(result['confidence'] * 1000),
+                result['trust_delta']
+            )
+            result['trust_update'] = trust_result
+            
+            # Settle job if trust update succeeded
+            settle_result = {'status': 'skipped', 'reason': 'trust_not_confirmed'}
+            if trust_result.get('status') == 'confirmed':
+                time.sleep(2)
+                settle_result = call_settle_job(
                     job_data.get('machine_id'),
                     job_data.get('job_pubkey'),
-                    job_data.get('job_hash'),
-                    int(result['confidence'] * 1000),
-                    result['trust_delta']
+                    job_data.get('owner_id')
                 )
-                result['trust_update'] = trust_result
-                print(f"[DEBUG] trust_result: {trust_result}")
-                
-                # Step 2: Settle job and distribute MINT (if trust update succeeded)
-                if trust_result.get('status') in ['sent', 'confirmed', 'sent_unconfirmed']:
-                    # Small delay to let trust update confirm
-                    time.sleep(5)
-                    settle_result = call_settle_job(
-                        job_data.get('machine_id'),
-                        job_data.get('job_pubkey'),
-                        job_data.get('owner_id')
-                    )
-                    result['settle'] = settle_result
-                    print(f"[DEBUG] settle_result: {settle_result}")
-                    if settle_result.get('status') == 'sent':
-                        print(f"[SETTLE] TX: {settle_result.get('signature', 'unknown')[:16]}...")
-                else:
-                    result['settle'] = {'status': 'skipped', 'reason': 'trust_update_failed'}
-                
-                econ = result['economics']
-                print(f"[MINT] #{econ['network_jobs']} | {job_data.get('machine_id','')[:8]}... | "
-                      f"{econ['duration_seconds']}s @ {econ['complexity_claimed']:.2f} | "
-                      f"norm:{econ['normalized_complexity']:.2f} | "
-                      f"base:{econ['base_reward']:.4f} | trust:{econ['trust_score']} | "
-                      f"final:{econ['final_reward']:.4f} MINT | "
-                      f"ML:{result['confidence']*100:.1f}%→{result['action']}")
-                results.append(result)
+            result['settle'] = settle_result
+            
+            # Add Solscan URLs
+            if trust_result.get('signature'):
+                result['trust_tx_url'] = f"{SOLSCAN_TX_URL}{trust_result['signature']}"
+            if settle_result.get('signature'):
+                result['settle_tx_url'] = f"{SOLSCAN_TX_URL}{settle_result['signature']}"
+            
+            # Update history with settle TX
+            update_history(
+                job_data.get('machine_id'),
+                job_data.get('complexity_claimed', 1.0),
+                job_data.get('duration_seconds', 300),
+                result['economics']['final_reward'],
+                tx_sig=settle_result.get('signature')
+            )
+            
+            # Store for API
+            scored_jobs.append({
+                'timestamp': datetime.now().isoformat(),
+                'job_hash': job_hash,
+                'machine_id': job_data.get('machine_id'),
+                'owner_id': job_data.get('owner_id'),
+                'duration_seconds': job_data.get('duration_seconds'),
+                'complexity_claimed': job_data.get('complexity_claimed'),
+                'confidence': result['confidence'],
+                'action': result['action'],
+                'trust_delta': result['trust_delta'],
+                'economics': result['economics'],
+                'record_tx': signature,
+                'trust_tx': trust_result.get('signature'),
+                'settle_tx': settle_result.get('signature'),
+                'solscan': {
+                    'record': f"{SOLSCAN_TX_URL}{signature}",
+                    'trust': f"{SOLSCAN_TX_URL}{trust_result.get('signature', '')}" if trust_result.get('signature') else None,
+                    'settle': f"{SOLSCAN_TX_URL}{settle_result.get('signature', '')}" if settle_result.get('signature') else None,
+                }
+            })
+            if len(scored_jobs) > 1000:
+                scored_jobs.pop(0)
+            
+            # Log summary
+            econ = result['economics']
+            settle_status = '✓' if settle_result.get('status') == 'sent' else '✗'
+            print(f"[JOB] {job_hash} | {job_data.get('machine_id','')[:8]}... | "
+                  f"{econ['duration_seconds']}s | {econ['final_reward']:.4f} MINT | "
+                  f"trust:{econ['trust_score']} | settle:{settle_status}")
+            
+            results.append(result)
+        
         return jsonify({'status': 'processed', 'results': results, 'count': len(results)})
     except Exception as e:
-        print(f"WEBHOOK ERROR: {e}")
+        print(f"[ERROR] Webhook: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/stats')
@@ -605,8 +632,10 @@ def economy():
     net_avg = get_network_avg_complexity()
     machines_summary = []
     for mid, h in machine_history.items():
+        recent_txs = h.get('transactions', [])[-5:]
         machines_summary.append({
-            'id': mid[:12] + '...',
+            'id': mid,
+            'id_short': mid[:12] + '...',
             'jobs': h['job_count'],
             'trust': h['trust_score'],
             'warmup': round(calculate_warmup(h['job_count']), 2),
@@ -614,7 +643,12 @@ def economy():
             'total_duration_hours': round(h['total_duration'] / 3600, 2),
             'avg_complexity': round(np.mean(h['complexities'][-20:]) if h['complexities'] else 1.0, 2),
             'avg_duration': round(np.mean(h['durations'][-20:]) if h['durations'] else 300, 0),
-            'earning_rate_per_hour': round(h['total_earned'] / (h['total_duration'] / 3600) if h['total_duration'] > 0 else 0, 4)
+            'earning_rate_per_hour': round(h['total_earned'] / (h['total_duration'] / 3600) if h['total_duration'] > 0 else 0, 4),
+            'solscan_url': f"{SOLSCAN_ACCOUNT_URL}{mid}",
+            'recent_transactions': [
+                {'signature': t['sig'], 'reward': t['reward'], 'url': f"{SOLSCAN_TX_URL}{t['sig']}"}
+                for t in recent_txs
+            ]
         })
     machines_summary.sort(key=lambda x: -x['total_earned'])
     return jsonify({
@@ -634,6 +668,8 @@ def economy():
             'avg_duration': round(np.mean(network_stats['durations'][-1000:]) if network_stats['durations'] else 300, 1),
         },
         'machines': machines_summary[:20],
+        'program_id': PROGRAM_ID,
+        'solscan_program': f"{SOLSCAN_ACCOUNT_URL}{PROGRAM_ID}",
         'timestamp': datetime.now().isoformat()
     })
 
@@ -642,6 +678,7 @@ def machine_info(machine_id):
     h = machine_history.get(machine_id)
     if not h:
         return jsonify({'error': 'Machine not found'}), 404
+    recent_txs = h.get('transactions', [])[-10:]
     return jsonify({
         'machine_id': machine_id,
         'job_count': h['job_count'],
@@ -651,7 +688,12 @@ def machine_info(machine_id):
         'total_duration_hours': round(h['total_duration'] / 3600, 2),
         'avg_complexity': round(np.mean(h['complexities'][-20:]) if h['complexities'] else 1.0, 3),
         'avg_duration': round(np.mean(h['durations'][-20:]) if h['durations'] else 300, 1),
-        'earning_rate_per_hour': round(h['total_earned'] / (h['total_duration'] / 3600) if h['total_duration'] > 0 else 0, 6)
+        'earning_rate_per_hour': round(h['total_earned'] / (h['total_duration'] / 3600) if h['total_duration'] > 0 else 0, 6),
+        'solscan_url': f"{SOLSCAN_ACCOUNT_URL}{machine_id}",
+        'recent_transactions': [
+            {'signature': t['sig'], 'reward': t['reward'], 'url': f"{SOLSCAN_TX_URL}{t['sig']}", 'timestamp': t['ts']}
+            for t in recent_txs
+        ]
     })
 
 @app.route('/calculate-reward', methods=['POST'])
