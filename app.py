@@ -451,11 +451,27 @@ def call_settle_job(machine_pubkey, job_pubkey, owner_pubkey):
 
 def extract_job_data(tx):
     from solders.pubkey import Pubkey
+    # Try multiple payload formats
     instructions = tx.get('instructions', [])
-    print(f"[DEBUG] Found {len(instructions)} instructions")
+    
+    # Helius raw format - check transaction.message.instructions
+    if not instructions and 'transaction' in tx:
+        msg = tx.get('transaction', {}).get('message', {})
+        instructions = msg.get('instructions', [])
+        account_keys = msg.get('accountKeys', [])
+        print(f"[DEBUG] Found transaction.message with {len(instructions)} instructions")
+        # Convert indexed format to named format
+        converted = []
+        for ix in instructions:
+            prog_idx = ix.get('programIdIndex', -1)
+            prog_id = account_keys[prog_idx] if prog_idx >= 0 and prog_idx < len(account_keys) else ''
+            accts = [account_keys[i] for i in ix.get('accounts', []) if i < len(account_keys)]
+            converted.append({'programId': prog_id, 'accounts': accts, 'data': ix.get('data', '')})
+        instructions = converted
+    
+    print(f"[DEBUG] Processing {len(instructions)} instructions")
     for ix in instructions:
-        print(f"[DEBUG] Checking programId: {ix.get('programId', 'NONE')}")
-        print(f"[DEBUG] Expected: {PROGRAM_ID}")
+        print(f"[DEBUG] programId: {ix.get('programId', 'NONE')[:20]}...")
         if ix.get('programId', '') == PROGRAM_ID:
             accounts = ix.get('accounts', [])
             if len(accounts) >= 5:
