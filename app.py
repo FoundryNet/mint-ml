@@ -497,6 +497,7 @@ def health():
 def webhook():
     try:
         payload = request.json
+        print(f"[DEBUG] Raw webhook payload: {str(payload)[:500]}")
         if not payload:
             return jsonify({'status': 'no payload'}), 200
         transactions = payload if isinstance(payload, list) else [payload]
