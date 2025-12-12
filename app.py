@@ -452,7 +452,10 @@ def call_settle_job(machine_pubkey, job_pubkey, owner_pubkey):
 def extract_job_data(tx):
     from solders.pubkey import Pubkey
     instructions = tx.get('instructions', [])
+    print(f"[DEBUG] Found {len(instructions)} instructions")
     for ix in instructions:
+        print(f"[DEBUG] Checking programId: {ix.get('programId', 'NONE')}")
+        print(f"[DEBUG] Expected: {PROGRAM_ID}")
         if ix.get('programId', '') == PROGRAM_ID:
             accounts = ix.get('accounts', [])
             if len(accounts) >= 5:
